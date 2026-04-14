@@ -16,8 +16,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -37,36 +39,44 @@ import kotlin.math.floor
 import kotlin.math.log10
 import kotlin.math.pow
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RainScreen(vm: RainViewModel) {
     val s by vm.state.collectAsStateWithLifecycle()
-    Column(
+    PullToRefreshBox(
+        isRefreshing = s.loading,
+        onRefresh = vm::refresh,
         modifier = Modifier
             .fillMaxSize()
-            .safeDrawingPadding()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+            .safeDrawingPadding(),
     ) {
-        Text("Rainfall", style = MaterialTheme.typography.headlineMedium)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("Rainfall", style = MaterialTheme.typography.headlineMedium)
 
-        StatusRow(s, onRefresh = vm::refresh)
+            StatusRow(s, onRefresh = vm::refresh)
 
-        val t = s.totals
-        if (t == null) {
-            Text(
-                if (s.loading) "Contacting RPi…"
-                else "No data yet. Tap Refresh to try again.",
-                style = MaterialTheme.typography.bodyLarge,
-            )
-        } else {
-            // generatedAt is unix seconds on the wire; convert to ms for the
-            // tick helpers, which format with SimpleDateFormat.
-            val nowMs = t.generatedAt * 1000L
-            RainCard("Last 24 hours", t.last24hIn,  t.last24hSeriesIn,  ticksLast24h(nowMs))
-            RainCard("Last 7 days",   t.lastWeekIn, t.lastWeekSeriesIn, ticksLastWeek(nowMs))
-            RainCard("Last month",    t.lastMonthIn, t.lastMonthSeriesIn, ticksLastMonth(nowMs))
-            RainCard("Last year",     t.lastYearIn,  t.lastYearSeriesIn,  ticksLastYear(nowMs))
+            val t = s.totals
+            if (t == null) {
+                Text(
+                    if (s.loading) "Contacting RPi…"
+                    else "No data yet. Tap Refresh to try again.",
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+            } else {
+                // generatedAt is unix seconds on the wire; convert to ms for the
+                // tick helpers, which format with SimpleDateFormat.
+                val nowMs = t.generatedAt * 1000L
+                RainCard("Last 24 hours", t.last24hIn,  t.last24hSeriesIn,  ticksLast24h(nowMs))
+                RainCard("Last 7 days",   t.lastWeekIn, t.lastWeekSeriesIn, ticksLastWeek(nowMs))
+                RainCard("Last month",    t.lastMonthIn, t.lastMonthSeriesIn, ticksLastMonth(nowMs))
+                RainCard("Last year",     t.lastYearIn,  t.lastYearSeriesIn,  ticksLastYear(nowMs))
+            }
         }
     }
 }
@@ -123,7 +133,7 @@ private fun RainCard(
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
             Text(
-                String.format(Locale.US, "%s — %.3f in", title, totalIn),
+                String.format(Locale.US, "%s — %.2f in", title, totalIn),
                 style = MaterialTheme.typography.titleMedium,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth(),
@@ -285,12 +295,11 @@ private fun niceYAxis(dataMax: Double): YAxis {
         next += step
     }
     ticks.add(next)
-    val decimals = when {
-        step >= 1.0  -> 0
-        step >= 0.1  -> 2   // cover 0.25, 0.5
-        step >= 0.01 -> 3   // cover 0.025, 0.05
-        else         -> 4
-    }
+    // Cap at 2 decimal places everywhere in the app. For very small
+    // steps (e.g. 0.005) this means adjacent ticks may round to the same
+    // 2-decimal string — an acceptable tradeoff for the "no more than
+    // 2 decimals anywhere" rule.
+    val decimals = if (step >= 1.0) 0 else 2
     return YAxis(max = next, ticks = ticks, decimals = decimals)
 }
 
@@ -332,25 +341,59 @@ private fun ticksLast24h(nowMs: Long): List<XTick> {
 }
 
 private fun ticksLastWeek(nowMs: Long): List<XTick> {
-    val dayMs = 86400_000L
+    val spanMs = 7L * 86400_000L
+    val startMs = nowMs - spanMs
     val fmt = SimpleDateFormat("EEE", Locale.US)
-    // 8 ticks, one per day boundary.
-    return (0..7).map { i ->
-        val frac = i / 7f
-        val t = nowMs - 7 * dayMs + i * dayMs
-        XTick(frac, fmt.format(Date(t)))
+
+    // Place a tick at every local midnight falling within the 7-day
+    // window, so labels line up with the actual day boundaries of the
+    // bars underneath (not with the current time of day).
+    val cal = Calendar.getInstance().apply {
+        timeInMillis = startMs
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+        if (timeInMillis < startMs) add(Calendar.DAY_OF_MONTH, 1)
     }
+
+    val ticks = mutableListOf<XTick>()
+    while (cal.timeInMillis <= nowMs) {
+        val frac = (cal.timeInMillis - startMs).toFloat() / spanMs
+        ticks.add(XTick(frac, fmt.format(cal.time)))
+        cal.add(Calendar.DAY_OF_MONTH, 1)
+    }
+    return ticks
 }
 
+private val MONTH_TICK_DAYS = setOf(1, 5, 10, 15, 20, 25)
+
 private fun ticksLastMonth(nowMs: Long): List<XTick> {
-    val dayMs = 86400_000L
+    val spanMs = 30L * 86400_000L
+    val startMs = nowMs - spanMs
     val fmt = SimpleDateFormat("d", Locale.US)
-    // 7 ticks every 5 days over 30 days.
-    return (0..6).map { i ->
-        val frac = i / 6f
-        val t = nowMs - 30 * dayMs + i * 5 * dayMs
-        XTick(frac, fmt.format(Date(t)))
+
+    // Emit a tick at local midnight whenever the day-of-month is in
+    // MONTH_TICK_DAYS. Yields round, clock-anchored day numbers and
+    // always includes the 1st so month transitions are visible.
+    val cal = Calendar.getInstance().apply {
+        timeInMillis = startMs
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+        if (timeInMillis < startMs) add(Calendar.DAY_OF_MONTH, 1)
     }
+
+    val ticks = mutableListOf<XTick>()
+    while (cal.timeInMillis <= nowMs) {
+        if (cal.get(Calendar.DAY_OF_MONTH) in MONTH_TICK_DAYS) {
+            val frac = (cal.timeInMillis - startMs).toFloat() / spanMs
+            ticks.add(XTick(frac, fmt.format(cal.time)))
+        }
+        cal.add(Calendar.DAY_OF_MONTH, 1)
+    }
+    return ticks
 }
 
 private fun ticksLastYear(nowMs: Long): List<XTick> {
