@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -35,21 +36,38 @@ object RainApi {
 
     fun parseJson(json: String): RainTotals {
         val root = JSONObject(json)
-        val t = root.getJSONObject("totals")
-        fun mm(name: String) = t.getJSONObject(name).getDouble("mm")
-        fun inches(name: String) = t.getJSONObject(name).getDouble("inches")
+        val totals = root.getJSONObject("totals")
+        val series = root.getJSONObject("series")
+
+        fun inches(name: String) = totals.getJSONObject(name).getDouble("inches")
+        fun bins(name: String): List<Double> =
+            series.getJSONObject(name).getJSONArray("binsIn").toDoubleList()
+        fun binSec(name: String): Long =
+            series.getJSONObject(name).getLong("binSec")
+
         return RainTotals(
-            last24hMm   = mm("last24h"),
-            last24hIn   = inches("last24h"),
-            lastWeekMm  = mm("lastWeek"),
-            lastWeekIn  = inches("lastWeek"),
-            lastMonthMm = mm("lastMonth"),
-            lastMonthIn = inches("lastMonth"),
-            lastYearMm  = mm("lastYear"),
-            lastYearIn  = inches("lastYear"),
-            generatedAt = root.getLong("generatedAt"),
+            last24hIn        = inches("last24h"),
+            last24hSeriesIn  = bins("last24h"),
+            last24hBinSec    = binSec("last24h"),
+
+            lastWeekIn       = inches("lastWeek"),
+            lastWeekSeriesIn = bins("lastWeek"),
+            lastWeekBinSec   = binSec("lastWeek"),
+
+            lastMonthIn       = inches("lastMonth"),
+            lastMonthSeriesIn = bins("lastMonth"),
+            lastMonthBinSec   = binSec("lastMonth"),
+
+            lastYearIn        = inches("lastYear"),
+            lastYearSeriesIn  = bins("lastYear"),
+            lastYearBinSec    = binSec("lastYear"),
+
+            generatedAt   = root.getLong("generatedAt"),
             latestArchive =
                 if (root.isNull("latestArchive")) null else root.optLong("latestArchive"),
         )
     }
+
+    private fun JSONArray.toDoubleList(): List<Double> =
+        List(length()) { getDouble(it) }
 }

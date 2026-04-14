@@ -1,12 +1,14 @@
 package com.rtm.rain
 
 import android.content.Context
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
  * Persists the most recent successful fetch so the app can show something
- * useful when the RPi is unreachable. Backed by SharedPreferences — a single
- * JSON blob plus the wall-clock time we saved it.
+ * useful when the RPi is unreachable. Backed by SharedPreferences — a
+ * single JSON blob (identical shape to what the RPi serves, including
+ * per-bin series arrays) plus the wall-clock time we saved it.
  */
 class RainCache(ctx: Context) {
 
@@ -30,20 +32,37 @@ class RainCache(ctx: Context) {
         val obj = JSONObject().apply {
             put("generatedAt", totals.generatedAt)
             totals.latestArchive?.let { put("latestArchive", it) }
-            val t = JSONObject()
-            fun w(name: String, mm: Double, inches: Double) {
-                t.put(name, JSONObject().put("mm", mm).put("inches", inches))
-            }
-            w("last24h",   totals.last24hMm,   totals.last24hIn)
-            w("lastWeek",  totals.lastWeekMm,  totals.lastWeekIn)
-            w("lastMonth", totals.lastMonthMm, totals.lastMonthIn)
-            w("lastYear",  totals.lastYearMm,  totals.lastYearIn)
-            put("totals", t)
+
+            put("totals", JSONObject().apply {
+                putTotal("last24h",   totals.last24hIn)
+                putTotal("lastWeek",  totals.lastWeekIn)
+                putTotal("lastMonth", totals.lastMonthIn)
+                putTotal("lastYear",  totals.lastYearIn)
+            })
+
+            put("series", JSONObject().apply {
+                putSeries("last24h",   totals.last24hBinSec,   totals.last24hSeriesIn)
+                putSeries("lastWeek",  totals.lastWeekBinSec,  totals.lastWeekSeriesIn)
+                putSeries("lastMonth", totals.lastMonthBinSec, totals.lastMonthSeriesIn)
+                putSeries("lastYear",  totals.lastYearBinSec,  totals.lastYearSeriesIn)
+            })
         }
         prefs.edit()
             .putString(KEY_PAYLOAD, obj.toString())
             .putLong(KEY_FETCHED_AT, System.currentTimeMillis())
             .apply()
+    }
+
+    private fun JSONObject.putTotal(name: String, inches: Double) {
+        put(name, JSONObject()
+            .put("inches", inches)
+            .put("mm", inches * 25.4))
+    }
+
+    private fun JSONObject.putSeries(name: String, binSec: Long, bins: List<Double>) {
+        put(name, JSONObject()
+            .put("binSec", binSec)
+            .put("binsIn", JSONArray(bins)))
     }
 
     companion object {

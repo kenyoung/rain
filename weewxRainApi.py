@@ -1,25 +1,48 @@
 #!/usr/bin/env python3
 """
-weewxRainApi: small read-only HTTP service exposing rainfall totals from a
-weewx SQLite database.
+weewxRainApi: small read-only HTTP service exposing rainfall totals and
+per-bin time series from a weewx SQLite database.
 
 Endpoints:
-  GET /rain    -> JSON totals for last 24h, 7d, 30.43685d, 365.25d
+  GET /rain    -> JSON totals + series for last 24h / 7d / ~month / ~year
   GET /health  -> {"ok": true}
+
+Response shape:
+  {
+    "generatedAt":    <unix seconds when this payload was built>,
+    "latestArchive":  <unix seconds of newest archive record, or null>,
+    "earliestArchive": <unix seconds of oldest archive record, or null>,
+    "totals": {
+      "last24h":   {"mm": X, "inches": Y},
+      "lastWeek":  {...},
+      "lastMonth": {...},
+      "lastYear":  {...}
+    },
+    "series": {
+      "last24h":   {"binSec": 900,    "binsIn": [N floats]},   # 96 bins
+      "lastWeek":  {"binSec": 3600,   "binsIn": [N floats]},   # 168 bins
+      "lastMonth": {"binSec": 86400,  "binsIn": [N floats]},   # 30 bins
+      "lastYear":  {"binSec": 604800, "binsIn": [N floats]}    # 52 bins
+    }
+  }
+
+  Each series has binsIn[0] = oldest bin, binsIn[-1] = newest bin,
+  which ends at generatedAt. Bins are rolling and anchored to "now"
+  (not clock-aligned). Per-window totals are the sum of that window's
+  binsIn array (so the chart title and the series match exactly).
 
 SAFETY
 ------
-The weewx database is opened in SQLite read-only URI mode (`mode=ro`).
-This process will never write to, truncate, or re-initialise the DB.
+The weewx database is opened in SQLite read-only URI mode (`mode=ro`)
+with `PRAGMA query_only = ON`. This process will never write to,
+truncate, or re-initialise the DB.
 
 WAL-MODE NOTE
 -------------
-weewx typically runs SQLite in WAL mode. A read-only connection still needs
-to touch the `-shm` / `-wal` sidecar files in the DB directory. The safest
-way to run this service is as the same user that weewx runs as (often
-`weewx` or `root` depending on install), so the sidecar files already exist
-and are readable. If you see "unable to open database file" errors under
-WAL mode, run this service as the weewx user, e.g. via a systemd unit:
+weewx typically runs SQLite in WAL mode. A read-only connection still
+needs to touch the `-shm` / `-wal` sidecar files in the DB directory.
+Run this service as the same user that weewx runs as so those files are
+readable. Sample systemd unit:
 
     [Unit]
     Description=weewx rain API
@@ -32,9 +55,6 @@ WAL mode, run this service as the weewx user, e.g. via a systemd unit:
 
     [Install]
     WantedBy=multi-user.target
-
-Edit DB_PATH below if your weewx database lives somewhere other than the
-Debian-package default.
 """
 import json
 import sqlite3
@@ -51,52 +71,68 @@ UNITS_US = 1        # rain in inches
 UNITS_METRIC = 16   # rain in cm
 UNITS_METRICWX = 17 # rain in mm
 
-SECONDS_PER_DAY = 86400
-WINDOWS = {
-    "last24h":    1.0        * SECONDS_PER_DAY,
-    "lastWeek":   7.0        * SECONDS_PER_DAY,
-    "lastMonth":  30.43685   * SECONDS_PER_DAY,
-    "lastYear":   365.25     * SECONDS_PER_DAY,
+# Conversion factor from each usUnits code into millimetres.
+MM_PER_UNIT = {
+    UNITS_US: 25.4,       # inches -> mm
+    UNITS_METRIC: 10.0,   # cm     -> mm
+    UNITS_METRICWX: 1.0,  # mm     -> mm
 }
+
+# One entry per chart. binSec = width of a bar in seconds;
+# binCount = number of bars (also determines the chart's total span).
+SERIES_SPECS = [
+    ("last24h",   900,     96),   # 96 x 15 min  = 24.00 h
+    ("lastWeek",  3600,    168),  # 168 x 1 h    = 7.00 d
+    ("lastMonth", 86400,   30),   # 30 x 1 d     = 30 d (~month)
+    ("lastYear",  604800,  52),   # 52 x 7 d     = 364 d (~year)
+]
 
 
 def openDbReadOnly(path):
-    # The file: URI plus mode=ro guarantees the connection is read-only;
-    # any attempted write raises SQLITE_READONLY.
     uri = f"file:{path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    # Extra belt-and-braces: set a read-only PRAGMA too. (mode=ro already
-    # enforces this, but this makes intent obvious.)
     conn.execute("PRAGMA query_only = ON")
     return conn
 
 
-def rainTotalMm(conn, sinceTs, untilTs):
-    """Sum `rain` in the archive table between sinceTs and untilTs,
-    converting per-record to millimetres based on that record's usUnits."""
+def rainSeriesInches(conn, nowTs, binSec, binCount):
+    """Return a list of length `binCount` giving inches of rain per bin,
+    with index 0 = oldest, index -1 = newest (ending at nowTs).
+
+    Records whose usUnits code isn't recognised are silently skipped and
+    returned as the second element, `unknownUnits`, so the caller can
+    surface a diagnostic."""
+    startTs = nowTs - binCount * binSec
+    bins = [0.0] * binCount
+    unknownUnits = set()
+
+    # Group rows by (bin index, usUnits). One row per group reduces the
+    # per-record Python work to a handful of rows even for the year chart.
     cur = conn.execute(
         """
-        SELECT usUnits, SUM(rain)
+        SELECT CAST((dateTime - ?) / ? AS INTEGER) AS bin,
+               usUnits,
+               SUM(rain) AS total
         FROM archive
         WHERE dateTime > ? AND dateTime <= ? AND rain IS NOT NULL
-        GROUP BY usUnits
+        GROUP BY bin, usUnits
         """,
-        (sinceTs, untilTs),
+        (startTs, binSec, startTs, nowTs),
     )
-    totalMm = 0.0
-    unknownUnits = []
-    for usUnits, s in cur:
-        if s is None:
+    for binIdx, usUnits, total in cur:
+        if total is None:
             continue
-        if usUnits == UNITS_US:
-            totalMm += s * 25.4       # inches -> mm
-        elif usUnits == UNITS_METRIC:
-            totalMm += s * 10.0       # cm -> mm
-        elif usUnits == UNITS_METRICWX:
-            totalMm += s              # already mm
-        else:
-            unknownUnits.append(usUnits)
-    return totalMm, unknownUnits
+        if binIdx < 0 or binIdx >= binCount:
+            # Shouldn't happen given the WHERE clause, but guard anyway.
+            continue
+        factor = MM_PER_UNIT.get(usUnits)
+        if factor is None:
+            unknownUnits.add(usUnits)
+            continue
+        # Convert native units -> mm -> inches, then accumulate.
+        bins[binIdx] += total * factor / 25.4
+
+    return bins, unknownUnits
 
 
 def buildPayload():
@@ -104,23 +140,34 @@ def buildPayload():
     with openDbReadOnly(DB_PATH) as conn:
         latest = conn.execute("SELECT MAX(dateTime) FROM archive").fetchone()[0]
         earliest = conn.execute("SELECT MIN(dateTime) FROM archive").fetchone()[0]
+
+        series = {}
         totals = {}
-        warnings = set()
-        for name, span in WINDOWS.items():
-            mm, unknown = rainTotalMm(conn, nowTs - span, nowTs)
-            totals[name] = {
-                "mm":     round(mm, 3),
-                "inches": round(mm / 25.4, 4),
+        unknownAll = set()
+        for name, binSec, binCount in SERIES_SPECS:
+            binsIn, unknown = rainSeriesInches(conn, nowTs, binSec, binCount)
+            unknownAll.update(unknown)
+            totalIn = sum(binsIn)
+            # Round per-bin to 4 dp so the JSON stays compact without
+            # losing meaningful precision (0.0001 in = 0.0025 mm).
+            series[name] = {
+                "binSec":  binSec,
+                "binsIn":  [round(v, 4) for v in binsIn],
             }
-            warnings.update(unknown)
+            totals[name] = {
+                "mm":      round(totalIn * 25.4, 3),
+                "inches":  round(totalIn, 4),
+            }
+
     payload = {
         "generatedAt":    nowTs,
         "latestArchive":  latest,
         "earliestArchive": earliest,
         "totals":         totals,
+        "series":         series,
     }
-    if warnings:
-        payload["unknownUsUnits"] = sorted(warnings)
+    if unknownAll:
+        payload["unknownUsUnits"] = sorted(unknownAll)
     return payload
 
 
@@ -147,8 +194,6 @@ class RainHandler(BaseHTTPRequestHandler):
             self.sendJson(404, {"error": "not found"})
 
     def log_message(self, fmt, *args):
-        # Keep stdout quiet; uncomment for debugging:
-        # super().log_message(fmt, *args)
         return
 
 
