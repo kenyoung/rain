@@ -96,6 +96,13 @@ private fun StatusRow(s: UiState, onRefresh: () -> Unit) {
             }
             Text(label, style = MaterialTheme.typography.bodySmall)
         }
+        s.wifiNotice?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.tertiary,
+            )
+        }
         s.lastError?.let {
             Text(
                 "Last error: $it",
