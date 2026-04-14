@@ -1,0 +1,31 @@
+# Claude harness droppings
+/.claude/
+/#prompt#
+/rtm@*
+
+# Python
+__pycache__/
+*.pyc
+
+# --- Android / Gradle ---
+
+# Build outputs
+android/build/
+android/app/build/
+android/**/build/
+
+# Gradle caches & daemon state
+android/.gradle/
+android/.kotlin/
+
+# User-specific: points at the local Android SDK install path
+android/local.properties
+
+# Android Studio / IntelliJ settings (per-user, not per-project)
+android/.idea/
+*.iml
+
+# Captured HPROFs, NDK output
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/

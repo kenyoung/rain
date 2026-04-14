@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Minimal NoActionBar theme. The Compose content drives all styling
+      via MaterialTheme{} in MainActivity.
+    -->
+    <style name="Theme.Rain" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
